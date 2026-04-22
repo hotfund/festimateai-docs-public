@@ -1,7 +1,8 @@
 # AI Planner — Step 2.5 Beauty Micro-step UX 상세
 
-> **작성**: 2026-04-22
+> **작성**: 2026-04-22 / **갱신**: 2026-04-22 (v1.1)
 > **위상**: AI Planner v1.0 구현 가이드 — §3-4 "Beauty Intent 추가 Step" 심화
+> **조언 크레딧**: Claude (초안 v1.0) + Genspark (Advisor, Wireflow·Validation 규칙·State machine·auto 모드 제안)
 > **선행 문서**:
 > - `AI_PLANNER_PAGE_DESIGN.md` v1.0 §3-4 (개요)
 > - `AI_PLANNER_EDGE_CASES.md` v1.1 E. Beauty (EC-07, 15, 16, 17, 18)
@@ -40,15 +41,47 @@ AI_PLANNER_PAGE_DESIGN.md §3-4는 Step 2.5를 15줄로 요약. 실제 구현하
 
 세 모드는 같은 Step 2.5 화면에서 **상단 배너·본문 레이아웃만 바뀜**.
 
-### 1-3. 사용자가 고르지 않는 것
+### 1-3. 사용자가 고르지 않는 것 (UX 마찰 최소화)
 
-- **다운타임 패턴 A/B/C**: AI가 자동 산정 → 사용자는 **확인만**
 - **시술 타이밍 (Day N)**: Step 2.5에서 안 정함 → 최종 AI 플랜 결과에 반영
 - **클리닉**: Step 2.5에서 안 고름 → AI Matching 이후 단계
 
+### 1-4. 타이밍 패턴은 "선택"이지만 강제 아님 (v1.1 수정)
+
+v1.0에서는 AI 자동 산정 후 "사용자 승인"을 강제했으나, UX 마찰이 큼 → v1.1에서 완화:
+
+- 시스템이 downtime 기반으로 **추천 패턴** 제시 (`AI 추천` 배지)
+- 사용자 택1:
+  - `procedure_first` (A) — 시술 먼저
+  - `travel_first` (B) — 여행 먼저
+  - `anytime` (C) — 언제든
+  - **`auto` — AI에게 맡기기** (승인 없이 Step 3 진행 허용, AI가 플랜 생성 시점에 최종 결정)
+- 내부 코드는 A/B/C 유지, 외부 payload에는 semantic enum 사용
+
 ---
 
-## 2. 상태 모델
+## 2. Wireflow — 단계별 Step ID (v1.1 신규)
+
+프론트 라우팅·QA 핸드오프용 공식 Step ID.
+
+| Step ID | 화면 | 목적 | Primary CTA | Secondary CTA | 완료 조건 | 다음 |
+|---------|------|------|-------------|---------------|----------|------|
+| **WF-00** | Role 토글 | Tourist/Mate 선택 | `여행 플랜 만들기` | `역할 바꾸기` | Tourist 선택 | WF-01 |
+| **WF-01** | Intent 선택 | 의도 카드 복수 선택 | `다음` | — | intent ≥ 1 | beauty 포함 시 WF-02, 아니면 WF-04 |
+| **WF-02** | Step 2.5-A 시술 선택 | beauty 컨텍스트 확정 | `시술 타이밍 정하기` | `건너뛰고 추천받기` | 시술 ≥ 1 or discovery mode | WF-03 |
+| **WF-03** | Step 2.5-B 타이밍 패턴 | 시술↔여행 배치 원칙 | `이 방식으로 진행` | `🤖 AI에게 맡기기` | 패턴 선택 or `auto` | WF-04 |
+| **WF-04** | Step 3 기본 정보 | 5필드 입력 | `AI 플랜 생성` | `이전` | 필수값 통과 | WF-05 |
+| **WF-05** | Step 4 생성 중 | AI 호출 진행 | (disabled) | `취소` (2초 윈도우) | 응답 수신 | WF-06 |
+| **WF-06** | Step 5 결과 | 플랜 검토·액션 | `💎 AI Matching` | `💾 저장` `🔗 공유` `🔄 재생성` | 렌더 성공 | 후속 플로우 |
+
+### 핵심 규칙
+- **Beauty는 conditional step**: beauty intent 없으면 WF-02/03 건너뜀
+- **WF-02 skip = discovery mode**: 완전 차단 X
+- **WF-03 skip = `auto` 모드**: AI가 생성 시점에 패턴 결정
+
+---
+
+## 3. 상태 모델
 
 ```typescript
 interface BeautyMicroState {
@@ -59,10 +92,12 @@ interface BeautyMicroState {
   // ── 담긴 시술 ────────────────────────
   treatments: BeautyTreatment[];
   
-  // ── 패턴 (AI 산정, 사용자 승인) ──────
-  primaryPattern: 'A' | 'B' | 'C' | null;
+  // ── 패턴 (v1.1: auto 모드 추가) ──────
+  timingPattern: 'procedure_first' | 'travel_first' | 'anytime' | 'auto';
+  // 내부 매핑: procedure_first=A, travel_first=B, anytime=C
+  recommendedPattern: 'A' | 'B' | 'C' | null;    // AI 추천 (참조용)
   exceptions: TreatmentException[];
-  userApprovedPattern: boolean;    // false면 AI 호출 차단
+  hasMixedDowntime: boolean;                     // derived flag
   
   // ── Discovery 모드 전용 ──────────────
   discoveryHints?: {
@@ -73,6 +108,10 @@ interface BeautyMicroState {
   
   // ── 유실 방지 (EC-07) ────────────────
   hiddenDraft?: BeautyTreatment[];   // intent off 시 treatments를 여기로 이동
+  
+  // ── 편집 충돌·stale (v1.1 신규) ──────
+  draftVersion: number;              // 편집할 때마다 증가
+  resultStale: boolean;              // 결과 생성 후 입력 변경되면 true
 }
 
 interface BeautyTreatment {
@@ -96,9 +135,9 @@ interface TreatmentException {
 
 ---
 
-## 3. 모드별 UX
+## 4. 모드별 UX
 
-### 3-1. Cart 모드 — `/beauty`에서 담아옴 (가장 일반적)
+### 4-1. Cart 모드 — `/beauty`에서 담아옴 (가장 일반적)
 
 **진입 조건**: `entrySource=wishlist` + wish_ids에 `procedure` 타입 1개 이상
 
@@ -128,18 +167,20 @@ interface TreatmentException {
 │  • 울쎄라: 귀국 1일 전 받기 (다운타임 일본 회복)  │
 │  • 비행 제한 없음 확인됨                          │
 │                                                │
-│  [✓ 이 제안으로 진행]   [패턴 다시 계산]          │
+│  [✓ 이 패턴으로 진행]  [🤖 AI에게 맡기기]         │
+│                             [패턴 다시 계산]       │
 └────────────────────────────────────────────────┘
 ```
 
 **인터랙션**:
 - 상단 시술 목록: 삭제·우선도 변경 시 하단 AI 제안 재계산 (debounce 500ms)
 - "+ 시술 더 추가" → 모달 (Manual 모드 검색 UI 재사용)
-- 패턴 승인 전에는 Step 3 (Base Input) CTA 비활성화
+- **v1.1**: 패턴 승인은 선택 사항. `auto` 모드로 진행 시 AI가 플랜 생성 시점에 최종 결정
+- `auto` 선택 시 `timingPattern: 'auto'`, `recommendedPattern`은 참조용으로 보존
 
 ---
 
-### 3-2. Manual 모드 — 시술 검색·추가
+### 4-2. Manual 모드 — 시술 검색·추가
 
 **진입 조건**: Cart 모드 상태에서 "+ 시술 더 추가" / Discovery 모드에서 "직접 선택"
 
@@ -172,7 +213,7 @@ interface TreatmentException {
 
 ---
 
-### 3-3. Discovery 모드 — beauty 체크만, 시술 0개 (EC-16)
+### 4-3. Discovery 모드 — beauty 체크만, 시술 0개 (EC-16)
 
 **진입 조건**: beauty intent 체크, treatments 비어 있음, wish_ids에 clinic 타입 없음
 
@@ -212,9 +253,9 @@ interface TreatmentException {
 
 ---
 
-## 4. 다운타임 패턴 자동 산정 (EC-17 구현)
+## 5. 다운타임 패턴 자동 산정 (EC-17 구현)
 
-### 4-1. 입력
+### 5-1. 입력
 
 ```typescript
 interface PatternInput {
@@ -225,7 +266,7 @@ interface PatternInput {
 }
 ```
 
-### 4-2. 알고리즘 (클라이언트 측 pure function)
+### 5-2. 알고리즘 (클라이언트 측 pure function)
 
 ```typescript
 function computePattern(input: PatternInput): PatternResult {
@@ -257,7 +298,7 @@ function computePattern(input: PatternInput): PatternResult {
 }
 ```
 
-### 4-3. 출력 예시 (보톡스 + 울쎄라 + 스킨부스터)
+### 5-3. 출력 예시 (보톡스 + 울쎄라 + 스킨부스터)
 
 ```
 primary: 'B'                       // 울쎄라 14일 기준
@@ -272,18 +313,18 @@ sameDayBundles: [
 flightWarnings: []
 ```
 
-### 4-4. UI 표시 규칙
+### 5-4. UI 표시 규칙
 
-- primary 패턴은 **한 줄 요약**으로만 노출 ("B 패턴: 여행 먼저")
+- primary 패턴은 **한 줄 요약**으로만 노출 ("B 패턴: 여행 먼저") + `AI 추천` 배지
 - exceptions는 **시술별 배지**로 표시 (🔔 "귀국 직전 권장")
 - sameDayBundles는 **그룹핑 박스**로 시각화 ("⊕ 같은 날 가능")
-- 사용자 액션: `[✓ 이 제안으로 진행]` / `[패턴 다시 계산]` / `[무시하고 직접 배치]`
+- 사용자 액션 (v1.1): `[✓ 이 패턴으로 진행]` / `[🤖 AI에게 맡기기]` / `[패턴 다시 계산]`
 
 ---
 
-## 5. Beauty off → 데이터 보존 (EC-07)
+## 6. Beauty off → 데이터 보존 (EC-07)
 
-### 5-1. 해제 시 처리
+### 6-1. 해제 시 처리
 
 ```typescript
 function onBeautyIntentOff(state: BeautyMicroState): BeautyMicroState {
@@ -292,14 +333,15 @@ function onBeautyIntentOff(state: BeautyMicroState): BeautyMicroState {
     active: false,
     hiddenDraft: state.treatments,   // 통째로 이동
     treatments: [],
-    primaryPattern: null,
+    timingPattern: 'auto',
+    recommendedPattern: null,
     exceptions: [],
-    userApprovedPattern: false,
+    resultStale: true,
   };
 }
 ```
 
-### 5-2. 재체크 시 복원
+### 6-2. 재체크 시 복원
 
 ```typescript
 function onBeautyIntentOn(state: BeautyMicroState): BeautyMicroState {
@@ -309,16 +351,17 @@ function onBeautyIntentOn(state: BeautyMicroState): BeautyMicroState {
       active: true,
       treatments: state.hiddenDraft,
       hiddenDraft: undefined,
-      // 패턴은 재계산 필요
-      primaryPattern: null,
-      userApprovedPattern: false,
+      // 패턴은 재계산 필요 → auto 기본값
+      timingPattern: 'auto',
+      recommendedPattern: null,
+      resultStale: true,
     };
   }
   return { ...state, active: true, mode: 'discovery' };
 }
 ```
 
-### 5-3. 완전 삭제 조건
+### 6-3. 완전 삭제 조건
 
 - 세션 종료 (sessionStorage 만료)
 - 사용자가 명시적으로 "시술 전체 초기화" 버튼 클릭
@@ -326,14 +369,16 @@ function onBeautyIntentOn(state: BeautyMicroState): BeautyMicroState {
 
 ---
 
-## 6. AI 호출 Payload 계약
+## 7. AI 호출 Payload 계약 (v1.1 — semantic enum + stale/version)
 
 Step 2.5 결과물은 canonical payload에 다음과 같이 포함:
 
 ```json
 {
-  "intent": ["beauty", "festival"],
+  "intents": ["beauty", "festival"],
   "beauty": {
+    "mode": "cart",
+    "discoveryMode": false,
     "treatments": [
       { "procedureId": "uuid-보톡스",
         "variant": "사각턱",
@@ -349,7 +394,10 @@ Step 2.5 결과물은 canonical payload에 다음과 같이 포함:
         "source": "wishlist",
         "downtimeSnapshot": 3 }
     ],
-    "primaryPattern": "B",
+    "timingPattern": "travel_first",
+    "recommendedPattern": "B",
+    "primaryDowntimeDays": 14,
+    "hasMixedDowntime": true,
     "exceptions": [
       { "treatmentId": "uuid-울쎄라",
         "reason": "longer_downtime",
@@ -358,44 +406,169 @@ Step 2.5 결과물은 canonical payload에 다음과 같이 포함:
     "sameDayBundles": [
       ["uuid-보톡스", "uuid-스킨부스터"]
     ],
-    "userApprovedPattern": true,
-    "mode": "cart"
-  }
+    "notes": "여행 첫날 붓기는 피하고 싶음"
+  },
+  "draftVersion": 7,
+  "resultStale": false
 }
 ```
 
 **필드 설계 원칙**:
-- `mixed` 같은 derived flag는 **포함 안 함** (EC-06)
+- `timingPattern` enum: `procedure_first | travel_first | anytime | auto`
+  - `auto` → 서버가 AI 생성 시점에 최종 결정 (v1.1 추가)
+  - 내부 A/B/C 코드는 `recommendedPattern`에만 노출 (참조용)
+- `mixed` 같은 derived flag는 **포함 안 함** (EC-06); `hasMixedDowntime`은 **계산값 snapshot**으로 포함 (AI 프롬프트 분기용)
 - `downtimeSnapshot`은 요청 시점 값 고정 (나중에 DB 업데이트돼도 이 요청은 snapshot 유지)
 - `procedureId`는 canonical UUID, variant는 메타
-- `userApprovedPattern: false`면 서버가 400 반환 (AI 호출 방지)
+- `draftVersion`: 다중 탭 편집 충돌 감지 (EC-22)
+- `resultStale`: 결과 생성 후 입력 변경 시 true, 서버는 요청 거부 or 재생성 유도
 
 ---
 
-## 7. Edge Case 매핑 (구현 체크리스트)
+## 8. Validation 규칙 (v1.1 신규)
+
+프론트/서버 양쪽에서 공유되는 공식 rule ID. 구현 시 각 rule마다 테스트 케이스 1개 이상.
+
+### 8-1. Step 2.5-A 시술 선택
+
+| Rule ID | 조건 | 메시지 | 차단 | 처리 |
+|---------|------|--------|------|------|
+| **V-BEA-01** | `beauty=true` & treatments 비어 있음 | "시술 없이도 진행할 수 있어요. AI 추천 모드로 넘어갑니다." | 비차단 | discovery mode 전환 |
+| **V-BEA-02** | 동일 canonical treatment 중복 | "이미 추가된 시술입니다." | 부분차단 | dedupe 확인 모달 |
+| **V-BEA-03** | downtime 메타 없음 (procedures 레코드 누락) | "회복 정보가 불완전해 AI가 보수적으로 계산합니다." | 비차단 | `unknownDowntime: true` flag |
+| **V-BEA-04** | 시술 > 5개 | "한 번에 너무 많은 시술은 일정 품질을 낮출 수 있어요. 우선순위를 선택해주세요." | 소프트차단 | `priority=must` top N만 AI payload |
+| **V-BEA-05** | `/beauty` prefill 파싱 실패 | "가져온 시술 정보를 다시 확인해주세요." | 비차단 | prefill 제거 후 수동 선택 유도 |
+
+### 8-2. Step 2.5-B 타이밍 패턴
+
+| Rule ID | 조건 | 메시지 | 차단 | 처리 |
+|---------|------|--------|------|------|
+| **V-TIME-01** | `timingPattern` 값 없음 | "AI에게 맡기기로 자동 설정됩니다." | 비차단 | `auto` 저장 |
+| **V-TIME-02** | 긴 downtime(≥7일)인데 A 선택 | "이 시술은 여행 초반보다 귀국 직전이 더 적합할 수 있어요." | 비차단 | 경고 노출 후 허용 |
+| **V-TIME-03** | 짧은 downtime(≤1일)인데 B 선택 | "더 이른 일정에도 배치할 수 있어요." | 비차단 | 경고 노출 후 허용 |
+| **V-TIME-04** | `hasMixedDowntime=true` | "가장 긴 회복 시간을 기준으로 우선 배치합니다." | 비차단 | `exceptions[]` 생성 |
+| **V-TIME-05** | 여행일 < max(downtime) + 1 | "회복 시간을 고려하면 추천 가능한 시술이 제한될 수 있어요." | 비차단 | conservative prompt 추가 |
+
+### 8-3. Step 3 기본 입력
+
+| Rule ID | 조건 | 메시지 | 차단 | 처리 |
+|---------|------|--------|------|------|
+| **V-INP-01** | 날짜 start/end 없음 | "여행 날짜를 입력해주세요." | 차단 | submit 불가 |
+| **V-INP-02** | end < start | "종료일이 시작일보다 빠를 수 없어요." | 차단 | inline error |
+| **V-INP-03** | 인원 < 1 | "인원 수를 다시 확인해주세요." | 차단 | field reset |
+| **V-INP-04** | 예산 없음 | "예산이 없어도 생성 가능하지만 추천 정확도가 낮아질 수 있어요." | 비차단 | `budget: 'unknown'` 허용 |
+| **V-INP-05** | beauty on + notes 없음 | "원하시는 분위기나 회복 부담 정도를 적어주시면 더 정확해져요." | 비차단 | helper text만 |
+
+---
+
+## 9. Back / Skip / Edit 내비게이션 규칙 (v1.1 신규)
+
+| 동작 | 발생 위치 | 시스템 동작 | 데이터 보존 | UX |
+|------|----------|-----------|-----------|-----|
+| **Back** | WF-02 → WF-01 | Intent 화면 복귀 | 시술은 hiddenDraft | beauty 해제 전까지 복원 |
+| **Back** | WF-03 → WF-02 | 시술 선택 복귀 | 패턴 선택 유지 | 시술 수정 시 "패턴 재검토" 배너 |
+| **Back** | WF-04 → WF-03 | 타이밍 패턴 복귀 | base input 임시저장 | "변경 시 플랜이 달라질 수 있어요" |
+| **Skip** | WF-02 "건너뛰고 추천받기" | discovery mode 진입 | `treatments=[]` 유지 | AI가 후보 제안 |
+| **Skip** | WF-03 "AI에게 맡기기" | `timingPattern='auto'` | 추천 패턴 참조로 보존 | 결과에서 AI가 선택 패턴 설명 |
+| **Edit from Result** | WF-06 → beauty summary 클릭 | 해당 step 모달/복귀 | 기존 결과 stale marking | **"수정됨, 다시 생성 필요"** read-only 표시 |
+| **Intent off** | WF-01에서 beauty 해제 | Step 2.5 전체 비활성 | beautyDraft hidden 저장 | 재선택 시 복원, AI payload 제외 |
+| **Role toggle** | Tourist → Mate | Tourist draft 분리 저장 | beautyDraft는 Tourist 내부에만 | 역할 간 **자동 상속 금지** |
+
+### 핵심 원칙
+
+1. **삭제보다 숨김이 우선** — beauty off, depth downshift, back 모두 hidden draft 패턴 따름
+2. **결과 수정 = stale marking, 아님 patch** — WF-06에서 입력 변경 시 기존 결과 덮어쓰기 금지, `resultStale=true` 마킹 → 재생성 강제
+3. **Role 간 draft 공유 금지** — Tourist의 beauty 데이터가 Mate 모드로 넘어가면 의미 오염 (EC-12)
+
+---
+
+## 10. 상태 머신 키 (v1.1 신규)
+
+7개 상태 키. 디버그·analytics·QA 시나리오 작성 시 참조.
+
+| 상태 키 | 설명 | 진입 조건 | 이탈 조건 |
+|--------|------|----------|----------|
+| `intentSelected` | intent 1개 이상 선택됨 | intent ≥ 1 | intent 수정 |
+| `beautyDraft.empty` | beauty on + 시술 0개 | beauty=true & treatments=[] | 시술 추가 or discovery 진입 |
+| `beautyDraft.prefilled` | `/beauty`에서 자동 유입 | entrySource=wishlist & clinic wish_ids | 사용자 삭제 |
+| `timingPattern.manual` | A/B/C 사용자 직접 선택 | 패턴 카드 탭 | 편집 or `auto` 전환 |
+| `timingPattern.auto` | "AI에게 맡기기" 또는 skip | skip or 명시 선택 | 수동 패턴 선택 |
+| `plannerReady` | AI 생성 가능 상태 | 모든 필수 validation pass | validation fail |
+| `result.stale` | 결과 생성 후 입력 변경 | result 이후 편집 | regenerate 완료 |
+
+---
+
+## 11. CTA 문구 매트릭스 (v1.1 신규)
+
+### 11-1. Step별 CTA
+
+| 위치 | 상황 | 문구 | 타입 | 비고 |
+|------|------|------|------|------|
+| WF-01 Intent | beauty 포함 | `다음` | Primary | → WF-02 |
+| WF-02 | 시술 ≥ 1 | `시술 타이밍 정하기` | Primary | → WF-03 |
+| WF-02 | 시술 0개 | `건너뛰고 추천받기` | Secondary | discovery mode |
+| WF-03 | 패턴 탭 선택 | `이 방식으로 진행` | Primary | manual 저장 |
+| WF-03 | 선택 어려움 | `🤖 AI에게 맡기기` | Secondary | auto 저장 |
+| WF-04 Input | validation pass | `AI 플랜 생성` | Primary | → WF-05 |
+| WF-06 Result | 생성 완료 | `💎 AI Matching` | **Primary strong** | 가장 강조 |
+| WF-06 | 로그인 | `💾 저장` | Secondary | 비로그인 시 로그인 유도 |
+| WF-06 | 공유 | `🔗 공유` | Secondary | share URL 생성 |
+| WF-06 | 재생성 | `🔄 재생성` | Secondary warning | **"500pt 사용됩니다" 확인 모달** |
+
+### 11-2. 마이크로카피 (서브 텍스트)
+
+- **WF-02 헤더**: "뷰티 일정도 함께 최적화할까요?"
+- **WF-02 서브**: "시술을 고르면 회복 시간을 포함한 일정으로 최적화됩니다."
+- **WF-02 discovery 안내**: "아직 시술을 정하지 않으셨다면, 여행 일정에 맞는 후보를 AI가 먼저 제안해드릴게요."
+- **WF-03 헤더**: "시술 타이밍을 어떻게 잡을까요?"
+- **WF-03 서브**: "짧은 다운타임은 여행 초반, 긴 다운타임은 귀국 직전이 유리할 수 있어요."
+- **WF-06 Regenerate 확인**: "현재 조건으로 다시 생성합니다. 500pt가 사용됩니다."
+- **WF-06 Stale 배지**: "입력이 변경되었습니다. 다시 생성해주세요."
+
+---
+
+## 12. 결과 화면 연동 규칙 (v1.1 신규)
+
+Step 2.5 결과물이 WF-06 (결과 화면)에서 어떻게 시각화되는가.
+
+| 항목 | 반영 위치 | 규칙 |
+|------|----------|------|
+| **선택 시술** | Day Card 상단 요약 | 대표 시술명 + "외 N개" |
+| **회복 시간** | Timeline 블록 | 회복 일자를 반투명 블록으로 표시 |
+| **타이밍 패턴** | Plan note 태그 | `시술 먼저` / `여행 먼저` / `유연 배치` / `AI 자동` |
+| **Exceptions** | Warning box | 긴 downtime·귀국 직전 권장 등 |
+| **sameDayBundles** | Day Card 그룹핑 | "같은 날 가능" 묶음 표시 |
+| **후속 액션** | Sticky footer | 💎 Matching / 💾 / 🔗 / 🔄 |
+| **재생성 기준** | input hash | beauty params 포함 hash 기준, 불변 시 재호출 X |
+| **Stale 표시** | 전체 결과 overlay | `resultStale=true` 시 "입력 변경됨" 반투명 오버레이 + 재생성 CTA 강조 |
+
+---
+
+## 13. Edge Case 매핑 (구현 체크리스트)
 
 | EC | 적용 위치 | 이 문서 참조 |
 |----|----------|--------------|
-| EC-07 Beauty on/off soft delete | §5 hiddenDraft 패턴 | 복원 로직 구현 |
-| EC-15 Canonical dedupe | §3-2 Manual 모드 담기 | procedureId 비교 모달 |
-| EC-16 Discovery mode | §3-3 전체 | travelDays 기반 추천 호출 |
-| EC-17 Primary + exceptions | §4 알고리즘 | `computePattern` pure function |
+| EC-07 Beauty on/off soft delete | §6 hiddenDraft 패턴 | 복원 로직 구현 |
+| EC-15 Canonical dedupe | §4-2 Manual 모드 담기 | procedureId 비교 모달, V-BEA-02 |
+| EC-16 Discovery mode | §4-3 전체 | travelDays 기반 추천 호출, V-BEA-01 |
+| EC-17 Primary + exceptions | §5 알고리즘 | `computePattern` pure function, V-TIME-04 |
 | EC-18 Auto-check on wishlist prefill | 진입 로직 | wish_ids→beauty intent 자동 체크 토스트 |
+| EC-22 다중 탭 draftVersion | §7 payload | `draftVersion` 필드 |
 
 ---
 
-## 8. 구현 Phase 매핑 (EDGE_CASES §구현 순서)
+## 14. 구현 Phase 매핑 (EDGE_CASES §구현 순서)
 
 | Phase | 이 문서 작업 |
 |-------|-------------|
-| **A (상태 모델)** | §2 타입 정의 + reducer, §4 `computePattern` pure function, §5 hidden draft 전환 |
-| **B (보호 UX)** | §3-1 패턴 승인 CTA 잠금, §3-3 Discovery 실패 fallback, §5 재체크 복원 UI |
-| **C (서버 계약)** | §6 canonical payload 스키마 (zod), `userApprovedPattern` 서버 검증 |
-| **D (QA 회귀)** | §9 테스트 시나리오 자동화·수동 체크 |
+| **A (상태 모델)** | §3 타입 정의 + reducer, §5 `computePattern` pure function, §6 hidden draft 전환, §10 상태 머신 키 7개 확정 |
+| **B (보호 UX)** | §4-3 Discovery 실패 fallback, §6 재체크 복원 UI, §9 Back/Skip/Edit 내비게이션, §12 stale overlay, §11 CTA 문구·모달 |
+| **C (서버 계약)** | §7 canonical payload (zod), `timingPattern='auto'` 서버 처리, `resultStale=true` 400 반환, §8 Validation rule ID 공유 |
+| **D (QA 회귀)** | §15 테스트 시나리오 자동화·수동 체크, 15개 rule ID별 테스트 케이스 |
 
 ---
 
-## 9. QA 테스트 시나리오 (Step 2.5 전용)
+## 15. QA 테스트 시나리오 (Step 2.5 전용)
 
 ### Unit (Vitest)
 - `computePattern([보톡스 0일, 울쎄라 14일, 스킨부스터 3일])` → primary='B', exceptions에 울쎄라
@@ -406,24 +579,27 @@ Step 2.5 결과물은 canonical payload에 다음과 같이 포함:
 ### Integration (React Testing Library)
 - Cart 모드 진입 → 시술 3개 렌더링 → 1개 삭제 → 패턴 재계산 호출 확인
 - beauty 체크 해제 → treatments 비워짐 + hiddenDraft에 보존 확인
-- beauty 재체크 → treatments 복원 + `userApprovedPattern=false` 확인
+- beauty 재체크 → treatments 복원 + `timingPattern='auto'` + `resultStale=true` 확인
 - Discovery 모드 "AI 후보 추천" 실패 → "직접 선택하러 가기" CTA만 남는지 확인
+- WF-03에서 `AI에게 맡기기` 클릭 → `timingPattern='auto'` 저장 + WF-04 진입 가능 확인
+- WF-06 결과 상태에서 beauty summary edit → `resultStale=true` + overlay 노출 확인
 
 ### E2E (Playwright)
 - `/beauty`에서 시술 2개 담기 → `/ai/plan` 진입 → Step 2.5 자동 표시 + 자동 beauty intent 체크 확인
-- 패턴 승인 전 [다음] 버튼 비활성화 상태 확인
-- 패턴 승인 후 Step 3 진입 가능 확인
+- WF-02 skip → discovery mode → WF-03 스킵 → WF-04 진입 가능 (auto mode 전체 플로우)
+- WF-06 재생성 버튼 → 500pt 확인 모달 노출
 
-### Manual
+### Manual (iPhone Safari 우선)
 - [ ] Cart 모드에서 시술 우선도 변경 시 AI 패턴 재계산 (debounce 500ms)
-- [ ] same-day bundle 그룹핑 박스가 시각적으로 구분되는지 (iPhone Safari)
-- [ ] Discovery 모드 AI 추천 실패 시 사용자 당황 없는지
+- [ ] same-day bundle 그룹핑 박스가 시각적으로 구분되는지
+- [ ] Discovery 모드 AI 추천 실패 시 사용자 당황 없는지 (직접 선택 CTA 명확성)
 - [ ] 비행 제한 시술(예: 눈 시술 24h) 경고 배너 노출 확인
-- [ ] hiddenDraft 복원 시 `userApprovedPattern` 리셋되어 다시 승인 유도되는지
+- [ ] hiddenDraft 복원 시 `timingPattern='auto'`로 리셋되는지
+- [ ] 결과 화면에서 beauty 편집 후 stale overlay 시각 확인
 
 ---
 
-## 10. Config 연결 (ADMIN_CONFIGURABLE_PARAMS)
+## 16. Config 연결 (ADMIN_CONFIGURABLE_PARAMS)
 
 ```
 # 패턴 산정 임계값
@@ -441,11 +617,24 @@ beauty.discovery.enabled                = true   # 기능 토글
 
 # Dedupe
 beauty.dedupe.merge_on_variant_conflict = "confirm"   # "auto" | "confirm" | "keep_both"
+
+# 시술 개수 상한 (V-BEA-04)
+beauty.treatments.max_per_plan          = 5
+beauty.treatments.soft_limit_message    = "한 번에 너무 많은 시술은 일정 품질을 낮출 수 있어요."
+
+# 타이밍 패턴 기본값 (v1.1)
+beauty.timing.default_when_skipped      = "auto"      # "auto" | "prompt_required"
+beauty.timing.long_downtime_days        = 7           # V-TIME-02 기준
+beauty.timing.short_downtime_days       = 1           # V-TIME-03 기준
+
+# Stale result (v1.1)
+plan.result.stale_on_edit               = true
+plan.result.stale_overlay_enabled       = true
 ```
 
 ---
 
-## 11. Open Questions (Phase 2 이후)
+## 17. Open Questions (Phase 2 이후)
 
 1. **variant의 canonical 수준 어디까지?**
    - 현재: procedureId + variant 문자열
@@ -466,7 +655,7 @@ beauty.dedupe.merge_on_variant_conflict = "confirm"   # "auto" | "confirm" | "ke
 
 ---
 
-## 12. 관련 문서
+## 18. 관련 문서
 
 - `AI_PLANNER_PAGE_DESIGN.md` v1.0 §3-4 — Step 2.5 개요 + 3패턴 정의
 - `AI_PLANNER_EDGE_CASES.md` v1.1 §E — Beauty 5개 edge case
@@ -481,7 +670,8 @@ beauty.dedupe.merge_on_variant_conflict = "confirm"   # "auto" | "confirm" | "ke
 | 날짜 | 변경 | 사유 |
 |------|------|------|
 | 2026-04-22 | v1.0 최초 작성 | EC-07/15/16/17/18 구체화, 3모드(Cart/Manual/Discovery) 분기, primary+exceptions 알고리즘 |
+| 2026-04-23 | v1.1 | Genspark 조언 병합: §2 Wireflow(WF-00~06), §8 Validation rule ID 15개, §9 Back/Skip/Edit 내비게이션, §10 상태 머신 키 7개, §11 CTA·마이크로카피 매트릭스, §12 결과 화면 연동 규칙. `auto` 모드 추가(강제 승인 완화), `draftVersion`/`resultStale` 필드, semantic enum(`procedure_first/travel_first/anytime/auto`) |
 
 ---
 
-*버전: v1.0 / 마지막 업데이트: 2026-04-22*
+*버전: v1.1 / 마지막 업데이트: 2026-04-23*
