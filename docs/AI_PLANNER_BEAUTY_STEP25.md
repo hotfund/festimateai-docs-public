@@ -1,8 +1,8 @@
 # AI Planner — Step 2.5 Beauty Micro-step UX 상세
 
-> **작성**: 2026-04-22 / **갱신**: 2026-04-22 (v1.1)
+> **작성**: 2026-04-22 / **갱신**: 2026-04-23 (v1.2)
 > **위상**: AI Planner v1.0 구현 가이드 — §3-4 "Beauty Intent 추가 Step" 심화
-> **조언 크레딧**: Claude (초안 v1.0) + Genspark (Advisor, Wireflow·Validation 규칙·State machine·auto 모드 제안)
+> **조언 크레딧**: Claude (초안 v1.0) + Genspark (Advisor v1.1 Wireflow·Validation·State machine·auto 모드, v1.2 soft-block 정제·hybrid auto 프롬프트·stale top banner)
 > **선행 문서**:
 > - `AI_PLANNER_PAGE_DESIGN.md` v1.0 §3-4 (개요)
 > - `AI_PLANNER_EDGE_CASES.md` v1.1 E. Beauty (EC-07, 15, 16, 17, 18)
@@ -423,6 +423,58 @@ Step 2.5 결과물은 canonical payload에 다음과 같이 포함:
 - `draftVersion`: 다중 탭 편집 충돌 감지 (EC-22)
 - `resultStale`: 결과 생성 후 입력 변경 시 true, 서버는 요청 거부 or 재생성 유도
 
+### 7-1. `timingPattern='auto'` 서버 프롬프트 전략 (v1.2 신규)
+
+완전 자유(model-free)로 두면 출력 분산이 커져 QA 비용 폭증. 반대로 `recommendedPattern`을 사실상 강제하면 auto의 의미가 없어짐.
+
+**채택 전략: default-follow + explicit override (hybrid)**
+
+#### 프롬프트 구조
+```
+[입력 변수]
+- timingPattern: "auto"
+- recommendedPattern: "travel_first"        (클라 pure function 결과)
+- reason.maxDowntimeDays: 14
+- reason.hasMixedDowntime: true
+- trip.lengthDays: 4
+- trip.returnDayFixed: true
+- userNote: "귀국 전 시술은 피하고 싶어요"   (선택)
+
+[모델 지시]
+1. recommendedPattern을 우선 채택하라.
+2. 다음 제약이 recommendedPattern과 충돌하면 override 허용:
+   - 여행일 < max(downtime) + 1
+   - mixed downtime + 짧은 일정
+   - 사용자 메모가 명시적 선호 표현
+   - recovery metadata 불완전 (unknownDowntime=true)
+3. override 시 반드시 result.note에 1줄 이유 남길 것.
+   예: "귀국 전 시술 회피 메모로 procedure_first로 변경"
+```
+
+#### 상황별 의사결정 가이드
+
+| 상황 | 권장 분기 |
+|------|----------|
+| 단일 시술 + downtime 명확 | `recommendedPattern` 거의 고정 |
+| mixed downtime | `recommendedPattern` 우선, 제약 충돌 시 override |
+| 사용자 메모가 강한 선호 표현 | **사용자 메모 최우선** |
+| 여행일 < max(downtime) + 1 | 보수적 패턴(anytime 또는 travel_first) |
+| recovery metadata 불완전 | 보수적 패턴 + note에 불확실성 명시 |
+
+#### 서버 응답 구조 (auto 모드 추가 필드)
+```json
+{
+  "plan": { ... },
+  "beauty": {
+    "finalPattern": "procedure_first",
+    "patternDecisionMode": "auto_override",    // "auto_follow" | "auto_override"
+    "overrideReason": "귀국 전 시술 회피 메모 반영"
+  }
+}
+```
+
+**핵심 원칙**: auto는 "모델이 아무렇게나 정함"이 아니라 **설명 가능한 자동결정**. 사용자가 결과 화면에서 왜 이 패턴이 선택됐는지 이해 가능해야 함.
+
 ---
 
 ## 8. Validation 규칙 (v1.1 신규)
@@ -436,7 +488,7 @@ Step 2.5 결과물은 canonical payload에 다음과 같이 포함:
 | **V-BEA-01** | `beauty=true` & treatments 비어 있음 | "시술 없이도 진행할 수 있어요. AI 추천 모드로 넘어갑니다." | 비차단 | discovery mode 전환 |
 | **V-BEA-02** | 동일 canonical treatment 중복 | "이미 추가된 시술입니다." | 부분차단 | dedupe 확인 모달 |
 | **V-BEA-03** | downtime 메타 없음 (procedures 레코드 누락) | "회복 정보가 불완전해 AI가 보수적으로 계산합니다." | 비차단 | `unknownDowntime: true` flag |
-| **V-BEA-04** | 시술 > 5개 | "한 번에 너무 많은 시술은 일정 품질을 낮출 수 있어요. 우선순위를 선택해주세요." | 소프트차단 | `priority=must` top N만 AI payload |
+| **V-BEA-04** | 시술 > 5개 | "한 번에 너무 많은 시술은 일정 품질을 낮출 수 있어요. 5개 이하로 정리해주세요." | **Step-local soft-block** | **자동 절단 금지** — CTA(`시술 타이밍 정하기`) 비활성화 유지. 사용자가 직접 5개 이하로 줄일 때만 진행 허용. payload에 사용자 몰래 top-N 전송 X (v1.2 정제) |
 | **V-BEA-05** | `/beauty` prefill 파싱 실패 | "가져온 시술 정보를 다시 확인해주세요." | 비차단 | prefill 제거 후 수동 선택 유도 |
 
 ### 8-2. Step 2.5-B 타이밍 패턴
@@ -527,20 +579,66 @@ Step 2.5 결과물은 canonical payload에 다음과 같이 포함:
 
 ---
 
-## 12. 결과 화면 연동 규칙 (v1.1 신규)
+## 12. 결과 화면 연동 규칙 (v1.1 신규 / v1.2 stale UX 정제)
 
 Step 2.5 결과물이 WF-06 (결과 화면)에서 어떻게 시각화되는가.
+
+### 12-1. 필드 반영
 
 | 항목 | 반영 위치 | 규칙 |
 |------|----------|------|
 | **선택 시술** | Day Card 상단 요약 | 대표 시술명 + "외 N개" |
 | **회복 시간** | Timeline 블록 | 회복 일자를 반투명 블록으로 표시 |
 | **타이밍 패턴** | Plan note 태그 | `시술 먼저` / `여행 먼저` / `유연 배치` / `AI 자동` |
+| **Auto override reason** | Plan note 1줄 | `patternDecisionMode=auto_override`일 때만 노출 |
 | **Exceptions** | Warning box | 긴 downtime·귀국 직전 권장 등 |
 | **sameDayBundles** | Day Card 그룹핑 | "같은 날 가능" 묶음 표시 |
 | **후속 액션** | Sticky footer | 💎 Matching / 💾 / 🔗 / 🔄 |
 | **재생성 기준** | input hash | beauty params 포함 hash 기준, 불변 시 재호출 X |
-| **Stale 표시** | 전체 결과 overlay | `resultStale=true` 시 "입력 변경됨" 반투명 오버레이 + 재생성 CTA 강조 |
+
+### 12-2. Stale UX (v1.2 — top banner 중심)
+
+**결정**: 일본 20-30대 여성 UX 기준 full overlay는 "막힘·오류" 감각 → 이탈 위험. 대신 **top banner + sticky regenerate CTA 강조** 패턴 채택.
+
+```
+┌────────────────────────────────────────────────┐
+│  ⓘ 입력이 변경되었어요.                           │ ← top banner (pulse 애니)
+│    최신 추천을 보려면 다시 생성해 주세요.         │
+│                          [🔄 다시 생성]          │
+├────────────────────────────────────────────────┤
+│  Day 1                        (10~15% dim)     │
+│  ...기존 결과 계속 읽기 가능...                  │
+│                                                │
+│  Day 2                                          │
+│  ...                                            │
+├────────────────────────────────────────────────┤
+│  [💎 Matching] [💾 저장] [🔗 공유] [🔄 재생성] │
+│      ↑disabled   ↑draft만  ↑disabled  ↑pulse   │
+└────────────────────────────────────────────────┘
+```
+
+#### stale 상태 액션별 정책
+
+| 액션 | stale 상태 동작 | 이유 |
+|------|---------------|------|
+| **결과 읽기** | 그대로 가능 (10-15% dim) | 비교 감상 흐름 유지 |
+| **🔄 재생성** | 강조 (pulse 애니·색 대비) | 핵심 회복 경로 |
+| **💾 저장 (draft)** | 허용 | 작업 손실 방지 |
+| **💎 AI Matching** | **비활성** 또는 "최신 결과 생성 후 가능" 모달 | stale 데이터로 downstream 오염 방지 |
+| **🔗 공유** | **비활성** | 공유 URL은 최신 결과 기반이어야 함 |
+
+#### 금지 사항
+
+- ❌ Full-screen blocking overlay (사용자 혼남 느낌)
+- ❌ 결과 카드 완전 가림
+- ❌ "결과 사라짐" 착시 (이탈 유발)
+
+#### 허용 되는 약한 시각 효과
+
+- 10-15% 전체 dim
+- Banner pulse 애니메이션
+- Regenerate CTA 색 대비·크기 강조
+- stale 시술별 "변경됨" 작은 배지 (선택)
 
 ---
 
@@ -618,18 +716,35 @@ beauty.discovery.enabled                = true   # 기능 토글
 # Dedupe
 beauty.dedupe.merge_on_variant_conflict = "confirm"   # "auto" | "confirm" | "keep_both"
 
-# 시술 개수 상한 (V-BEA-04)
+# 시술 개수 상한 (V-BEA-04, v1.2 정제)
 beauty.treatments.max_per_plan          = 5
-beauty.treatments.soft_limit_message    = "한 번에 너무 많은 시술은 일정 품질을 낮출 수 있어요."
+beauty.treatments.over_limit_behavior   = "block_until_user_reduces"
+                                        # "block_until_user_reduces" (v1.2 기본, 자동 절단 금지)
+                                        # "auto_truncate" (레거시, 사용 권장 안 함)
+beauty.treatments.soft_limit_message    = "한 번에 너무 많은 시술은 일정 품질을 낮출 수 있어요. 5개 이하로 정리해주세요."
 
-# 타이밍 패턴 기본값 (v1.1)
+# 타이밍 패턴 기본값
 beauty.timing.default_when_skipped      = "auto"      # "auto" | "prompt_required"
 beauty.timing.long_downtime_days        = 7           # V-TIME-02 기준
 beauty.timing.short_downtime_days       = 1           # V-TIME-03 기준
 
-# Stale result (v1.1)
+# Auto 모드 서버 프롬프트 (v1.2 신규)
+beauty.auto.strategy                    = "default_follow_with_override"
+                                        # "default_follow_with_override" (v1.2 기본)
+                                        # "strict_follow" (override 금지)
+                                        # "free" (레거시)
+beauty.auto.override_reason_required    = true
+beauty.auto.conservative_on_unknown     = true        # metadata 불완전 시 보수적 패턴
+
+# Stale result (v1.2 — top banner 전환)
 plan.result.stale_on_edit               = true
-plan.result.stale_overlay_enabled       = true
+plan.result.stale_ux_mode               = "top_banner"
+                                        # "top_banner" (v1.2 기본)
+                                        # "soft_overlay" (선택, 10-15% dim만)
+                                        # "full_overlay" (사용 금지)
+plan.result.stale_dim_percent           = 12          # 0~20 권장
+plan.result.stale_disables              = ["matching", "share"]   # 저장은 draft만 허용
+plan.result.stale_regenerate_pulse      = true
 ```
 
 ---
@@ -671,7 +786,19 @@ plan.result.stale_overlay_enabled       = true
 |------|------|------|
 | 2026-04-22 | v1.0 최초 작성 | EC-07/15/16/17/18 구체화, 3모드(Cart/Manual/Discovery) 분기, primary+exceptions 알고리즘 |
 | 2026-04-23 | v1.1 | Genspark 조언 병합: §2 Wireflow(WF-00~06), §8 Validation rule ID 15개, §9 Back/Skip/Edit 내비게이션, §10 상태 머신 키 7개, §11 CTA·마이크로카피 매트릭스, §12 결과 화면 연동 규칙. `auto` 모드 추가(강제 승인 완화), `draftVersion`/`resultStale` 필드, semantic enum(`procedure_first/travel_first/anytime/auto`) |
+| 2026-04-23 | v1.2 | Genspark 2차 조언 정제: ① V-BEA-04 자동 top-N 절단 금지 + block_until_user_reduces 원칙, ② §7-1 auto 모드 hybrid 프롬프트 전략(default-follow + explicit override + override reason 필수), ③ §12 stale UX full overlay → top banner 전환(10-15% dim만, matching·share disabled, 저장은 draft만), ④ Config 7개 추가 (over_limit_behavior, auto.strategy, stale_ux_mode 등). **다음 단계: Phase A 착수 (Tourist+Beauty feature-flag scope)** |
 
 ---
 
-*버전: v1.1 / 마지막 업데이트: 2026-04-23*
+## 📍 다음 단계 (v1.2 확정 후)
+
+**→ Phase A 상태 모델 구현** (이 문서 §14 참조)
+
+- Scope: **Tourist + Beauty 경로만 먼저** (feature-flag으로 Mate·Festival-only 차단)
+- 산출물: 타입 정의 · reducer · `computePattern` · hiddenDraft 전환 · resultStale 마킹
+- Phase A 완료 후: Phase B (UI·validation·stale banner) → Phase C (서버 계약) → Phase D (QA)
+- `/ai/matching` 보강은 **Planner 상태 계약 안정 이후**로 미룸
+
+---
+
+*버전: v1.2 / 마지막 업데이트: 2026-04-23*
