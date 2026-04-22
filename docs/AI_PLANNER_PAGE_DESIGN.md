@@ -168,6 +168,15 @@ type Intent =
 
 패턴 B 전략: **귀국 직전 시술 → 다운타임은 일본에서 회복**.
 
+> ⚠ **중요**: 실제로는 사용자가 A/B/C를 고르지 않는다. AI가 담긴 시술의 `downtime_days_max` 기반으로 **primary pattern + exceptions** 자동 산정 (EC-17).
+> 사용자는 AI 제안을 **확인·승인**만 함. 승인 전에는 Step 3 CTA 잠김.
+
+**상세 UX·알고리즘·payload 스키마**: `AI_PLANNER_BEAUTY_STEP25.md` 참조
+- 3 모드 분기 (Cart / Manual / Discovery)
+- `computePattern()` pure function 명세
+- Canonical dedupe, hidden draft 복원, 서버 계약
+- Edge case (EC-07/15/16/17/18) 구현 매핑
+
 ---
 
 ## 4. Input Layer — Tourist (구 §4 재편)
