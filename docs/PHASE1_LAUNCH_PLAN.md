@@ -46,13 +46,22 @@
 
 ### 카테고리 A — 데이터 시드 (P0, 1-2주)
 
+**기본 방향 변경 (2026-04-25)**: 매주 갱신 필요한 카테고리는 **API 자동화**로 전환. 수동 시드 → 단발성. 자동화 → 영속적 가치.
+
 | ID | 제목 | 산출물 | 예상시간 | 의존성 | 담당 |
 |----|------|-------|---------|--------|------|
-| **A1** | 축제 시드 정비 | `festivals` 테이블 ~100행 정확도 검증·일본어 설명 보강 | 3-5일 | - | 대표님 + Opus(카피) |
-| **A2** | 명인명장 시드 50개 | `masters` 테이블 신규 + 50행 시드 | 2-3일 | A1 | 대표님 (수집) |
-| **A3** | 템플스테이 시드 30-50개 | `templestays` 테이블 신규 + 시드 | 2-3일 | A1 | 대표님 (한국문화관광공사 데이터) |
-| **A4** | 정원 시드 12개 (국가 2 + 지방 10) | `gardens` 테이블 신규 + 12행 시드 (산림청) | 1일 | - | 대표님 + Sonnet(스크립트) |
-| **A5** | 시드 데이터 일본어 설명 생성 | 각 카테고리 카드용 JP 설명 100자 내외 | 3-5일 | A1-A4 | Opus (생성) + 대표님 (검수) |
+| **A1** | **축제 TourAPI ETL 자동화** (7-step, 아래 sub-task) | `festivals` 테이블 + 매주 cron + publishable 80-120개 | 3-5일 | - | Opus(설계) + Sonnet(실행) |
+| **A1.1** | API 매핑 표 작성 | `docs/data/festival_api_mapping.md` (응답 JSON → FestiMate 필드 매핑, 필수/선택/폐기 3분류) | 0.5일 | TourAPI 키 | Opus |
+| **A1.2** | API 호출 샘플 수집 | `data/raw/festivals/sample_response_*.json` 3-5건 | 0.5일 | A1.1 | Sonnet |
+| **A1.3** | 최소 정규화 스키마 확정 | `docs/data/festival_schema_v1.md` (source_id, title_ko/ja, summary_ko/ja, dates, region, lat/lng, source_url, fetched_at 등) + migration | 0.5일 | A1.2 | Opus 설계 + Sonnet 실행 |
+| **A1.4** | fetch → normalize → upsert 3단 파이프라인 | `scripts/etl/festivals/fetch_raw.py`, `normalize.py`, `upsert.py` (재실행 가능, dedupe) | 1일 | A1.3 | Sonnet (구현) + Opus (normalize 규칙) |
+| **A1.5** | publish 규칙 정의 + subset 선별 | `docs/data/festival_publish_rules.md` + 80-120개 publishable 태깅 | 0.5일 | A1.4 | Opus 규칙 + Sonnet 적용 |
+| **A1.6** | 일본어 카드 설명 규칙 + 생성 | `docs/copy/festival_jp_copy_rules.md` (일본 20-30대 여성 톤, 80-100자) + `summary_ja` 적재 | 0.5-1일 | A1.5 | Opus (규칙·생성) + 대표님 (네이티브 검수) |
+| **A1.7** | `/search` 소비용 view + 운영 runbook | `festival_card_view` + `docs/ops/festival_etl_runbook.md` (Railway cron 매주 실행) | 0.5일 | A1.4-A1.5 | Sonnet 구현 + Opus 체크리스트 |
+| **A2** | 명인명장 시드 50개 | `masters` 테이블 신규 + 한국문화재재단 API or 수동 | 2-3일 | A1.3 | 대표님 (수집) + 향후 API 자동화 |
+| **A3** | **템플스테이 한국불교문화사업단 API** | `templestays` 테이블 + API ETL (A1과 같은 7-step 패턴 적용) | 2-3일 | A1.3 | Opus + Sonnet |
+| **A4** | 정원 시드 12개 (국가 2 + 지방 10) | `gardens` 테이블 + 12행 시드 (산림청 — API 없음, 수동) | 1일 | - | 대표님 + Sonnet(스크립트) |
+| **A5** | A2/A4 일본어 설명 생성 | A1.6 규칙 재사용 (Phase 1.5에 점진 보완) | 1-2일 | A1.6 | Opus + 대표님 검수 |
 
 ### 카테고리 B — Search 페이지 (P0, 1-2주)
 
@@ -279,7 +288,51 @@ docs/PHASE1_LAUNCH_PLAN.md 읽고 시작.
 | 날짜 | 변경 | 사유 |
 |------|------|------|
 | 2026-04-25 | v1.0 최초 작성 | Genspark 2회 왕복 검토 + Claude Opus 합의 |
+| 2026-04-25 | v1.1 — A1 축제 시드를 TourAPI ETL 자동화 7-step으로 변경 | 매주 갱신 필요한 데이터는 API 자동화 가치 큼. Genspark 축제 API 작업 착수안 v1 반영 |
 
 ---
 
-*최종 작성: 2026-04-25 / SSOT for Phase 1 launch*
+## 11. 축제 ETL 7-step 작업 원칙 (Genspark v1 합의)
+
+### 핵심 원칙
+- **Phase 1 핵심**: 검색형 사이트 + Lite AI Guide. 축제 데이터는 `/search`의 첫 실전 카테고리.
+- **고품질 subset 우선**: 처음부터 500개 전체 완벽 정제 X. publishable 80-120개 먼저.
+- **API 적재 ↔ JP 카피 분리**: Step 1-4(데이터 적재)와 Step 5(일본어 카피) 의존성 풀어줌.
+- **`/search` 연결 염두**: 최소 스키마부터 잠그기.
+- **출처 보존 필수**: `source_id`, `source_name`, `source_url`, `fetched_at` 항상 남김.
+
+### 모델 분리 (A1 7-step에서)
+
+| Step | Opus 4.7 (설계·검수) | Sonnet 4.6 (실행) |
+|------|--------------------|------------------|
+| A1.1 매핑 표 | ✅ 응답 JSON 분석·필드 분류 | - |
+| A1.2 샘플 수집 | - | ✅ API 호출·파일 저장 |
+| A1.3 스키마 | ✅ 컬럼·dedupe 기준 설계 | ✅ migration 작성 |
+| A1.4 ETL 파이프라인 | ✅ normalize 규칙 | ✅ Python 구현 |
+| A1.5 publish 규칙 | ✅ 기준 정의 | ✅ subset 태깅 |
+| A1.6 JP 카피 | ✅ 톤·규칙·생성 | ✅ DB 적재 |
+| A1.7 view + runbook | ✅ 체크리스트 | ✅ view·cron 구현 |
+
+### Definition of Done (오늘은 X — Phase 1 진행 중 충족)
+- 스크립트 1회 실행으로 raw → normalized → DB 반영 완료
+- 중복 삽입 없이 재실행 가능
+- publishable subset 80-120개 `is_published=true` 태깅
+- `festival_card_view`로 `/search`에서 즉시 consume 가능
+- 매주 Railway cron 실행 (Phase 1 출시 직전)
+
+### 하지 말 것 (이번 단계)
+- 축제 500개 전체 완벽 정제 집착
+- AI Planner 연동까지 한 번에
+- 다국어 전체 완성 (KR/JP만)
+- 카드 디자인·지도 UX 동시 깊이 파기
+- 이미지 수집 무리하게 확대
+
+### 참고: TourAPI 키 발급
+- 신청: `https://www.data.go.kr/data/15101578/openapi.do`
+- 클릭: 👉 [TourAPI 활용신청](https://www.data.go.kr/data/15101578/openapi.do)
+- 승인 1-2일 소요 — **지금 바로 신청** 권장
+- 다국어 지원 (ko/en/ja/zh)
+
+---
+
+*최종 작성: 2026-04-25 / v1.1 SSOT for Phase 1 launch*
