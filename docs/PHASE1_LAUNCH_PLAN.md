@@ -107,7 +107,7 @@
 | ID | 제목 | 산출물 | 예상시간 | 의존성 | 담당 |
 |----|------|-------|---------|--------|------|
 | **G1** | 결제 사전 설계 컬럼 | ai_usage_log + ledger 테이블 + 컬럼 (user_id, plan_id, estimated_cost, quota_snapshot, request_id, created_at) | 2일 | - | Opus |
-| **G2** | Supabase Storage 버킷 + python-dotenv | 운영 효율 (오늘 80% 진행됨) | 1일 | - | Sonnet |
+| **G2** | ✅ Supabase Storage 버킷 + CSV 업로드 | **2026-04-25 완료** — `etl-raw-csv` 버킷 + 8개 CSV (clinic_seoul.csv 등) + `upload_to_storage.py` 스크립트 (커밋 `1cbadaf`) | - | - | ✅ 완료 |
 | **G3** | Railway GitHub 자동 배포 | GitHub 복구 후 연동 | 0.5일 | GitHub | 대표님 + Sonnet |
 | **G4** | Naver API 토큰 재발급 | 노출된 토큰 정리 | 0.5일 | - | 대표님 |
 | **G5** | Admin: Supabase Studio 운영 가이드 | 시드 입력·검수·published 승급 SOP 문서 | 1일 | - | Opus |
